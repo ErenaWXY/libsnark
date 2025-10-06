@@ -138,12 +138,7 @@ pkg_check_modules(
 )
 
 if("${WITH_PROCPS}")
-  pkg_check_modules(
-    PROCPS
-    REQUIRED
-
-    libprocps
-  )
+pkg_check_modules(PROCPS REQUIRED libprocps libproc2)
 else()
   add_definitions(
     -DNO_PROCPS
