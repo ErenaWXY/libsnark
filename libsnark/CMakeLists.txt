@@ -189,6 +189,17 @@ if("${WITH_SUPERCOP}")
   )
 endif()
 
+# ZK sorting demos
+add_executable(
+  zk_sort_example
+  EXCLUDE_FROM_ALL
+  gadgetlib1/examples/zk_sort_example.cpp
+)
+target_link_libraries(
+  zk_sort_example
+  snark
+)
+
 # Profiling
 add_executable(
   profile_routing_algorithms
