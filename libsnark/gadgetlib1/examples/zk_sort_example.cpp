@@ -1,507 +1,413 @@
-// zk_sort_example.cpp (Groth16, robust)
-
+// MIT License
+// Sorting-network zkSNARK demo without packing_gadgets.hpp
+// Range checks are manual: boolean bits + linear combination equals the packed value.
+// (c) 2025
 
 #include <iostream>
 #include <vector>
 #include <algorithm>
-
-#include <libff/common/utils.hpp>
+#include <cstdint>
 
 #include <libsnark/common/default_types/r1cs_gg_ppzksnark_pp.hpp>
-#include <libsnark/relations/constraint_satisfaction_problems/r1cs/r1cs.hpp>
+#include <libsnark/gadgetlib1/protoboard.hpp>
+#include <libsnark/gadgetlib1/gadgets/basic_gadgets.hpp>
 #include <libsnark/zk_proof_systems/ppzksnark/r1cs_gg_ppzksnark/r1cs_gg_ppzksnark.hpp>
 
-#include <libsnark/gadgetlib1/gadget.hpp>
-#include <libsnark/gadgetlib1/protoboard.hpp>
-
-using ppT    = libsnark::default_r1cs_gg_ppzksnark_pp; // Groth16
-using FieldT = libff::Fr<ppT>;
 using namespace libsnark;
+using namespace std;
 
-// ------------------------------------------------------------
-// Helpers
-// ------------------------------------------------------------
-static std::vector<FieldT> pow2_cache(size_t k) {
-    std::vector<FieldT> p(k+1);
-    p[0] = FieldT::one();
-    for (size_t i = 1; i <= k; ++i) p[i] = p[i-1] + p[i-1]; // *2
-    return p;
-}
+// ---------- Manual k-bit "range" gadget: bits are boolean and sum(bits*2^i) = x ----------
+template<typename FieldT>
+struct kbits_range_manual {
+    protoboard<FieldT>& pb;
+    pb_variable<FieldT> x;
+    size_t k;
+    pb_variable_array<FieldT> bits;
+    std::vector<FieldT> weights; // 2^i precomputed
 
-// ------------------------------------------------------------
-// Less-than gadget via wrap-around: x < y  <=> exists c in {0,1}, z in [0,2^k-1]
-// s.t. x - y + c*2^k = z
-// Output: lt = c = [x < y]
-// ------------------------------------------------------------
-template<typename FieldT_>
-class less_than_wrap_gadget : public gadget<FieldT_> {
-public:
-    const size_t k;
-    pb_variable<FieldT_> x, y;          // inputs (packed field values)
-    pb_variable<FieldT_> lt;            // output bit: (x < y)
-    pb_variable<FieldT_> z;             // wrap value
-    pb_variable_array<FieldT_> z_bits;  // bit-decomp of z
-    std::vector<FieldT_> P2;            // powers of two
-
-    less_than_wrap_gadget(protoboard<FieldT_> &pb,
-                          const pb_variable<FieldT_> &x,
-                          const pb_variable<FieldT_> &y,
-                          const size_t k,
-                          const std::string &annotation="less_than_wrap")
-        : gadget<FieldT_>(pb, annotation), k(k), x(x), y(y) {
-        lt.allocate(pb, FMT(annotation, ".lt"));
-        z.allocate(pb,  FMT(annotation, ".z"));
-        z_bits.allocate(pb, k, FMT(annotation, ".z_bits"));
-        P2 = pow2_cache(k);
-    }
-
-    void generate_r1cs_constraints() {
-        // 1) Bits boolean: b*(b-1)=0
-        for (size_t i = 0; i < k; ++i) {
-            this->pb.add_r1cs_constraint(
-                r1cs_constraint<FieldT_>(z_bits[i], z_bits[i] - FieldT_::one(), FieldT_::zero()),
-                FMT(this->annotation_prefix, ".z_bits_bool_%zu", i)
-            );
-        }
-        // 2) lt boolean
-        this->pb.add_r1cs_constraint(
-            r1cs_constraint<FieldT_>(lt, lt - FieldT_::one(), FieldT_::zero()),
-            FMT(this->annotation_prefix, ".lt_bool")
-        );
-
-        // 3) z == sum z_bits[i] * 2^i
-        pb_linear_combination<FieldT_> sum;
-        for (size_t i = 0; i < k; ++i) sum.add_term(z_bits[i], P2[i]);
-        this->pb.add_r1cs_constraint(
-            r1cs_constraint<FieldT_>(sum - z, FieldT_::one(), FieldT_::zero()),
-            FMT(this->annotation_prefix, ".pack_z")
-        );
-
-        // 4) x - y + lt * 2^k = z
-        pb_linear_combination<FieldT_> lhs;
-        lhs.add_term(x, FieldT_::one());
-        lhs.add_term(y, FieldT_::zero() - FieldT_::one()); // -y
-        lhs.add_term(lt, P2[k]); // + lt * 2^k
-        this->pb.add_r1cs_constraint(
-            r1cs_constraint<FieldT_>(lhs - z, FieldT_::one(), FieldT_::zero()),
-            FMT(this->annotation_prefix, ".wrap")
-        );
-    }
-
-    void generate_r1cs_witness() {
-        // NOTE: demo k=16 => safe to read as ulong
-        const auto xv = this->pb.val(x).as_ulong();
-        const auto yv = this->pb.val(y).as_ulong();
-        const bool is_lt = (xv < yv);
-        this->pb.val(lt) = is_lt ? FieldT_::one() : FieldT_::zero();
-
-        // z = x - y + lt * 2^k
-        FieldT_ two_k = P2[k];
-        this->pb.val(z) = this->pb.val(x) - this->pb.val(y) + this->pb.val(lt) * two_k;
-
-        // Decompose z to bits (0..k-1)
-        auto z_big = this->pb.val(z).as_bigint();
-        for (size_t i = 0; i < k; ++i) {
-            bool bit = z_big.test_bit(i);
-            this->pb.val(z_bits[i]) = bit ? FieldT_::one() : FieldT_::zero();
+    kbits_range_manual(protoboard<FieldT>& pb,
+                       const pb_variable<FieldT>& x,
+                       size_t k,
+                       const std::string& anno)
+        : pb(pb), x(x), k(k)
+    {
+        bits.allocate(pb, k, anno + ".bits");
+        weights.resize(k);
+        FieldT w = FieldT::one();
+        const FieldT two = FieldT(2);
+        for (size_t i = 0; i < k; i++) {
+            weights[i] = w;
+            w *= two;
         }
     }
+
+    void generate_r1cs_constraints() {
+        for (size_t i = 0; i < k; i++) {
+            generate_boolean_r1cs_constraint<FieldT>(pb, bits[i], "bit");
+        }
+        // sum_i bits[i]*2^i = x   ⇒  1 * x = sum
+        linear_combination<FieldT> sum;
+        for (size_t i = 0; i < k; i++) sum.add_term(bits[i], weights[i]);
+        pb.add_r1cs_constraint(r1cs_constraint<FieldT>(1, x, sum), "pack_bits");
+    }
+
+    void witness_from_uint64(uint64_t v) {
+        for (size_t i = 0; i < k; i++) {
+            pb.val(bits[i]) = ((v >> i) & 1) ? FieldT::one() : FieldT::zero();
+        }
+        pb.val(x) = FieldT(v);
+    }
 };
 
-// ------------------------------------------------------------
-// Conditional swap gadget using 1 multiplication: given lt = [y < x]
-// lo = x + lt*(y - x),  hi = y - lt*(y - x)
-// ------------------------------------------------------------
-template<typename FieldT_>
-class cond_swap_gadget : public gadget<FieldT_> {
-public:
-    pb_variable<FieldT_> x, y;     // inputs
-    pb_variable<FieldT_> lt;       // bit
-    pb_variable<FieldT_> lo, hi;   // outputs
-    pb_variable<FieldT_> t;        // t = lt*(y-x)
+// ---------- Comparator (cmp-swap) gadget ----------
+template<typename FieldT>
+struct cmp_swap_gadget {
+    protoboard<FieldT> &pb;
+    size_t k;
+    pb_variable<FieldT> x, y, u, v;
+    pb_variable<FieldT> s; // boolean selector
+    pb_variable<FieldT> t; // t = v - u  (nonnegative via k-bit range)
+    kbits_range_manual<FieldT> *t_rng; // not owned
 
-    cond_swap_gadget(protoboard<FieldT_> &pb,
-                     const pb_variable<FieldT_> &x,
-                     const pb_variable<FieldT_> &y,
-                     const pb_variable<FieldT_> &lt,
-                     const pb_variable<FieldT_> &lo,
-                     const pb_variable<FieldT_> &hi,
-                     const std::string &annotation="cond_swap")
-        : gadget<FieldT_>(pb, annotation), x(x), y(y), lt(lt), lo(lo), hi(hi) {
-        t.allocate(pb, FMT(annotation, ".t"));
+    uint64_t u_u64 = 0, v_u64 = 0, t_u64 = 0;
+
+    cmp_swap_gadget(protoboard<FieldT>& pb,
+                    size_t k,
+                    const pb_variable<FieldT>& x,
+                    const pb_variable<FieldT>& y,
+                    const pb_variable<FieldT>& u,
+                    const pb_variable<FieldT>& v,
+                    const std::string& anno,
+                    kbits_range_manual<FieldT> *t_rng_ptr)
+        : pb(pb), k(k), x(x), y(y), u(u), v(v), t_rng(t_rng_ptr)
+    {
+        s.allocate(pb, anno + ".sel");
+        t.allocate(pb, anno + ".diff");
     }
 
     void generate_r1cs_constraints() {
-        // t = lt * (y - x)
-        this->pb.add_r1cs_constraint(
-            r1cs_constraint<FieldT_>(lt, y - x, t),
-            FMT(this->annotation_prefix, ".t")
-        );
-        // lo = x + t  => (lo - x - t) * 1 = 0
-        this->pb.add_r1cs_constraint(
-            r1cs_constraint<FieldT_>(lo - x - t, FieldT_::one(), FieldT_::zero()),
-            FMT(this->annotation_prefix, ".lo")
-        );
-        // hi = y - t  => (hi - y + t) * 1 = 0
-        this->pb.add_r1cs_constraint(
-            r1cs_constraint<FieldT_>(hi - y + t, FieldT_::one(), FieldT_::zero()),
-            FMT(this->annotation_prefix, ".hi")
-        );
+        generate_boolean_r1cs_constraint<FieldT>(pb, s, "sel_boolean");
+
+        // u - y = s * (x - y)   (valid R1CS: (a= s) * (b= x-y) = (c= u-y))
+        pb.add_r1cs_constraint(
+            r1cs_constraint<FieldT>(s, x - y, u - y),
+            "u - y = s*(x - y)");
+
+        // v = x + y - u        ⇒ 1 * v = x + y - u
+        pb.add_r1cs_constraint(
+            r1cs_constraint<FieldT>(1, v, x + y - u),
+            "v = x + y - u");
+
+        // t = v - u            ⇒ 1 * (v - u) = t
+        pb.add_r1cs_constraint(
+            r1cs_constraint<FieldT>(1, v - u, t),
+            "t = v - u");
+        // t range is enforced outside by t_rng
     }
 
-    void generate_r1cs_witness() {
-        const FieldT_ YminusX = this->pb.val(y) - this->pb.val(x);
-        this->pb.val(t)  = this->pb.val(lt) * YminusX;
-        this->pb.val(lo) = this->pb.val(x) + this->pb.val(t);
-        this->pb.val(hi) = this->pb.val(y) - this->pb.val(t);
-    }
-};
+    void generate_r1cs_witness(uint64_t x_u64, uint64_t y_u64) {
+        const bool sel = (x_u64 <= y_u64);
+        pb.val(s) = sel ? FieldT::one() : FieldT::zero();
 
-// ------------------------------------------------------------
-// Comparator: computes lt = [y < x] and then conditional swap
-// ------------------------------------------------------------
-template<typename FieldT_>
-class comparator_gadget : public gadget<FieldT_> {
-public:
-    const size_t k;
-    pb_variable<FieldT_> x, y;    // in
-    pb_variable<FieldT_> lo, hi;  // out
+        u_u64 = sel ? x_u64 : y_u64;
+        v_u64 = x_u64 + y_u64 - u_u64;
+        t_u64 = v_u64 - u_u64;
 
-    // internals
-    std::unique_ptr<less_than_wrap_gadget<FieldT_>> lt_gadg; // computes lt for (y < x)
-    std::unique_ptr<cond_swap_gadget<FieldT_>>      swap_gadg;
-
-    // keep variables for lt
-    pb_variable<FieldT_> lt; // [y < x]
-
-    comparator_gadget(protoboard<FieldT_> &pb,
-                      const pb_variable<FieldT_> &x,
-                      const pb_variable<FieldT_> &y,
-                      const pb_variable<FieldT_> &lo,
-                      const pb_variable<FieldT_> &hi,
-                      const size_t k,
-                      const std::string &annotation="cmp")
-        : gadget<FieldT_>(pb, annotation), k(k), x(x), y(y), lo(lo), hi(hi) {
-        lt_gadg.reset(new less_than_wrap_gadget<FieldT_>(pb, y, x, k, FMT(annotation, ".lt_y_lt_x")));
-        lt = lt_gadg->lt; // alias
-        swap_gadg.reset(new cond_swap_gadget<FieldT_>(pb, x, y, lt, lo, hi, FMT(annotation, ".swap")));
-    }
-
-    void generate_r1cs_constraints() {
-        lt_gadg->generate_r1cs_constraints();
-        swap_gadg->generate_r1cs_constraints();
-    }
-
-    void generate_r1cs_witness() {
-        lt_gadg->generate_r1cs_witness();
-        swap_gadg->generate_r1cs_witness();
+        pb.val(u) = FieldT(u_u64);
+        pb.val(v) = FieldT(v_u64);
+        pb.val(t) = FieldT(t_u64);
+        if (t_rng) t_rng->witness_from_uint64(t_u64);
     }
 };
 
-// ------------------------------------------------------------
-// (A) Sorting network for n=4: (1,2), (3,4), (1,3), (2,4), (2,3)
-// Public output: Y1..Y4 = sorted(A)
-// ------------------------------------------------------------
-bool run_example_A_sorting_network_4(const std::vector<size_t> &A_vals, size_t k_bits) {
-    std::cout << "\n[A] Sorting network demo" << std::endl;
-
+// ---------- [A] 4-input odd-even sorting network with full k-bit range checks ----------
+template<typename ppT>
+void run_sorting_network_demo_A(size_t k_bits)
+{
+    using FieldT = libff::Fr<ppT>;
     protoboard<FieldT> pb;
 
-    // --- Public outputs (must allocate first)
-    pb_variable<FieldT> Y1, Y2, Y3, Y4; // sorted outputs (public)
+    // Public outputs Y1..Y4 (primary)
+    pb_variable<FieldT> Y1, Y2, Y3, Y4;
     Y1.allocate(pb, "Y1");
     Y2.allocate(pb, "Y2");
     Y3.allocate(pb, "Y3");
     Y4.allocate(pb, "Y4");
     pb.set_input_sizes(4);
 
-    // --- Private inputs A (witness)
+    // Private inputs A1..A4
     pb_variable<FieldT> A1, A2, A3, A4;
     A1.allocate(pb, "A1");
     A2.allocate(pb, "A2");
     A3.allocate(pb, "A3");
     A4.allocate(pb, "A4");
 
-    // Stage wires
-    pb_variable<FieldT> b1, b2, b3, b4; // after (1,2) and (3,4)
-    pb_variable<FieldT> c1, c2, c3, c4; // after (1,3) and (2,4)
-    pb_variable<FieldT> d2, d3;         // after (2,3)
-    b1.allocate(pb, "b1"); b2.allocate(pb, "b2");
-    b3.allocate(pb, "b3"); b4.allocate(pb, "b4");
-    c1.allocate(pb, "c1"); c2.allocate(pb, "c2");
-    c3.allocate(pb, "c3"); c4.allocate(pb, "c4");
+    // Range constraints for inputs
+    kbits_range_manual<FieldT> A1_rng(pb, A1, k_bits, "A1_rng");
+    kbits_range_manual<FieldT> A2_rng(pb, A2, k_bits, "A2_rng");
+    kbits_range_manual<FieldT> A3_rng(pb, A3, k_bits, "A3_rng");
+    kbits_range_manual<FieldT> A4_rng(pb, A4, k_bits, "A4_rng");
+
+    // Intermediates
+    pb_variable<FieldT> b1, b2, b3, b4;
+    pb_variable<FieldT> c1, c2, c3, c4;
+    pb_variable<FieldT> d2, d3;
+
+    b1.allocate(pb, "b1"); b2.allocate(pb, "b2"); b3.allocate(pb, "b3"); b4.allocate(pb, "b4");
+    c1.allocate(pb, "c1"); c2.allocate(pb, "c2"); c3.allocate(pb, "c3"); c4.allocate(pb, "c4");
     d2.allocate(pb, "d2"); d3.allocate(pb, "d3");
 
-    // Build comparators
-    comparator_gadget<FieldT> cmp12(pb, A1, A2, b1, b2, k_bits, "cmp12");
-    comparator_gadget<FieldT> cmp34(pb, A3, A4, b3, b4, k_bits, "cmp34");
-    comparator_gadget<FieldT> cmp13(pb, b1, b3, c1, c3, k_bits, "cmp13");
-    comparator_gadget<FieldT> cmp24(pb, b2, b4, c2, c4, k_bits, "cmp24");
-    comparator_gadget<FieldT> cmp23(pb, c2, c3, d2, d3, k_bits, "cmp23");
+    // Range gadgets for all intermediates
+    kbits_range_manual<FieldT> b1_rng(pb, b1, k_bits, "b1_rng");
+    kbits_range_manual<FieldT> b2_rng(pb, b2, k_bits, "b2_rng");
+    kbits_range_manual<FieldT> b3_rng(pb, b3, k_bits, "b3_rng");
+    kbits_range_manual<FieldT> b4_rng(pb, b4, k_bits, "b4_rng");
+    kbits_range_manual<FieldT> c1_rng(pb, c1, k_bits, "c1_rng");
+    kbits_range_manual<FieldT> c2_rng(pb, c2, k_bits, "c2_rng");
+    kbits_range_manual<FieldT> c3_rng(pb, c3, k_bits, "c3_rng");
+    kbits_range_manual<FieldT> c4_rng(pb, c4, k_bits, "c4_rng");
+    kbits_range_manual<FieldT> d2_rng(pb, d2, k_bits, "d2_rng");
+    kbits_range_manual<FieldT> d3_rng(pb, d3, k_bits, "d3_rng");
 
-    // Tie final wires to public Y (equalities)
-    pb.add_r1cs_constraint(r1cs_constraint<FieldT>(c1 - Y1, FieldT::one(), FieldT::zero()), "y1_eq");
-    pb.add_r1cs_constraint(r1cs_constraint<FieldT>(d2 - Y2, FieldT::one(), FieldT::zero()), "y2_eq");
-    pb.add_r1cs_constraint(r1cs_constraint<FieldT>(d3 - Y3, FieldT::one(), FieldT::zero()), "y3_eq");
-    pb.add_r1cs_constraint(r1cs_constraint<FieldT>(c4 - Y4, FieldT::one(), FieldT::zero()), "y4_eq");
+    // Stage 1: (A1,A2)->(b1,b2), (A3,A4)->(b3,b4)
+    cmp_swap_gadget<FieldT> cmp12(pb, k_bits, A1, A2, b1, b2, "cmp12", nullptr);
+    cmp_swap_gadget<FieldT> cmp34(pb, k_bits, A3, A4, b3, b4, "cmp34", nullptr);
 
-    // Generate constraints
+    // Stage 2: (b1,b3)->(c1,c3), (b2,b4)->(c2,c4)
+    cmp_swap_gadget<FieldT> cmp13(pb, k_bits, b1, b3, c1, c3, "cmp13", nullptr);
+    cmp_swap_gadget<FieldT> cmp24(pb, k_bits, b2, b4, c2, c4, "cmp24", nullptr);
+
+    // Stage 3: (c2,c3)->(d2,d3)
+    cmp_swap_gadget<FieldT> cmp23(pb, k_bits, c2, c3, d2, d3, "cmp23", nullptr);
+
+    // t-range gadgets (now that t vars exist)
+    kbits_range_manual<FieldT> cmp12_t_rng(pb, cmp12.t, k_bits, "cmp12.t_rng"); cmp12.t_rng = &cmp12_t_rng;
+    kbits_range_manual<FieldT> cmp34_t_rng(pb, cmp34.t, k_bits, "cmp34.t_rng"); cmp34.t_rng = &cmp34_t_rng;
+    kbits_range_manual<FieldT> cmp13_t_rng(pb, cmp13.t, k_bits, "cmp13.t_rng"); cmp13.t_rng = &cmp13_t_rng;
+    kbits_range_manual<FieldT> cmp24_t_rng(pb, cmp24.t, k_bits, "cmp24.t_rng"); cmp24.t_rng = &cmp24_t_rng;
+    kbits_range_manual<FieldT> cmp23_t_rng(pb, cmp23.t, k_bits, "cmp23.t_rng"); cmp23.t_rng = &cmp23_t_rng;
+
+    // Constraints
+    A1_rng.generate_r1cs_constraints();
+    A2_rng.generate_r1cs_constraints();
+    A3_rng.generate_r1cs_constraints();
+    A4_rng.generate_r1cs_constraints();
+
     cmp12.generate_r1cs_constraints();
     cmp34.generate_r1cs_constraints();
     cmp13.generate_r1cs_constraints();
     cmp24.generate_r1cs_constraints();
     cmp23.generate_r1cs_constraints();
 
-    // Assign witness values
-    pb.val(A1) = FieldT(A_vals[0]);
-    pb.val(A2) = FieldT(A_vals[1]);
-    pb.val(A3) = FieldT(A_vals[2]);
-    pb.val(A4) = FieldT(A_vals[3]);
+    cmp12_t_rng.generate_r1cs_constraints();
+    cmp34_t_rng.generate_r1cs_constraints();
+    cmp13_t_rng.generate_r1cs_constraints();
+    cmp24_t_rng.generate_r1cs_constraints();
+    cmp23_t_rng.generate_r1cs_constraints();
 
-    // Run gadgets to compute outputs
-    cmp12.generate_r1cs_witness();
-    cmp34.generate_r1cs_witness();
-    cmp13.generate_r1cs_witness();
-    cmp24.generate_r1cs_witness();
-    cmp23.generate_r1cs_witness();
+    b1_rng.generate_r1cs_constraints();
+    b2_rng.generate_r1cs_constraints();
+    b3_rng.generate_r1cs_constraints();
+    b4_rng.generate_r1cs_constraints();
+    c1_rng.generate_r1cs_constraints();
+    c2_rng.generate_r1cs_constraints();
+    c3_rng.generate_r1cs_constraints();
+    c4_rng.generate_r1cs_constraints();
+    d2_rng.generate_r1cs_constraints();
+    d3_rng.generate_r1cs_constraints();
 
-    // Put Y to correct wires 
+    // Example private inputs (< 2^k_bits)
+    uint64_t a1 = 9, a2 = 1, a3 = 7, a4 = 3;
+
+    // Witness for inputs
+    A1_rng.witness_from_uint64(a1);
+    A2_rng.witness_from_uint64(a2);
+    A3_rng.witness_from_uint64(a3);
+    A4_rng.witness_from_uint64(a4);
+
+    // Stage 1
+    cmp12.generate_r1cs_witness(a1, a2);
+    b1_rng.witness_from_uint64(cmp12.u_u64);
+    b2_rng.witness_from_uint64(cmp12.v_u64);
+
+    cmp34.generate_r1cs_witness(a3, a4);
+    b3_rng.witness_from_uint64(cmp34.u_u64);
+    b4_rng.witness_from_uint64(cmp34.v_u64);
+
+    // Stage 2
+    cmp13.generate_r1cs_witness(cmp12.u_u64, cmp34.u_u64);
+    c1_rng.witness_from_uint64(cmp13.u_u64);
+    c3_rng.witness_from_uint64(cmp13.v_u64);
+
+    cmp24.generate_r1cs_witness(cmp12.v_u64, cmp34.v_u64);
+    c2_rng.witness_from_uint64(cmp24.u_u64);
+    c4_rng.witness_from_uint64(cmp24.v_u64);
+
+    // Stage 3
+    cmp23.generate_r1cs_witness(cmp24.u_u64, cmp13.v_u64);
+    d2_rng.witness_from_uint64(cmp23.u_u64);
+    d3_rng.witness_from_uint64(cmp23.v_u64);
+
+    // Public outputs
     pb.val(Y1) = pb.val(c1);
     pb.val(Y2) = pb.val(d2);
     pb.val(Y3) = pb.val(d3);
     pb.val(Y4) = pb.val(c4);
 
-    // Quick check
-    std::cout << " [A] is_satisfied = " << (pb.is_satisfied() ? "yes" : "no") << std::endl;
+    auto primary = pb.primary_input();
+    std::cout << "Primary (Y1..Y4): "
+              << primary[0] << ", "
+              << primary[1] << ", "
+              << primary[2] << ", "
+              << primary[3] << std::endl;
 
-    // ---- Prove / Verify (cache inputs!) ----
-    // --- FIXED PROVE/VERIFY FLOW FOR (A) ---
+    std::cout << "[A] is_satisfied = " << (pb.is_satisfied() ? "yes" : "no") << std::endl;
 
-    const r1cs_constraint_system<FieldT> csA = pbA.get_constraint_system();
-    const auto keypairA = r1cs_gg_ppzksnark_generator<ppT>(csA);
-
-
-    generate_r1cs_witness(); 
-
-    const auto primary_input_A   = pbA.primary_input();   
-    const auto auxiliary_input_A = pbA.auxiliary_input();
-
-    const auto proofA = r1cs_gg_ppzksnark_prover(keypairA.pk, primary_input_A, auxiliary_input_A);
-
-    const bool A_strong = r1cs_gg_ppzksnark_verifier_strong_IC(keypairA.vk, primary_input_A, proofA);
-    const bool A_weak   = r1cs_gg_ppzksnark_verifier_weak_IC  (keypairA.vk, primary_input_A, proofA);
-
-    std::cout << "A: Verified strong_IC=" << (A_strong ? "true":"false")
-            << " | weak_IC=" << (A_weak ? "true":"false") << std::endl;
-
-
+    // Prove & verify (Groth16)
+    const auto keypair = r1cs_gg_ppzksnark_generator<ppT>(pb.get_constraint_system());
+    const auto proof   = r1cs_gg_ppzksnark_prover    <ppT>(keypair.pk, primary, pb.auxiliary_input());
+    const bool ok_str  = r1cs_gg_ppzksnark_verifier_strong_IC<ppT>(keypair.vk, primary, proof);
+    const bool ok_weak = r1cs_gg_ppzksnark_verifier_weak_IC  <ppT>(keypair.vk, primary, proof);
+    std::cout << "A: Verified strong_IC=" << (ok_str ? "true" : "false")
+              << " | weak_IC=" << (ok_weak ? "true" : "false") << std::endl;
 }
 
-
-static void demo_A_fixed() {
-    using libsnark::protoboard;
-    using libsnark::pb_variable;
-    using libsnark::r1cs_constraint;
-    using libsnark::r1cs_gg_ppzksnark_generator;
-    using libsnark::r1cs_gg_ppzksnark_prover;
-    using libsnark::r1cs_gg_ppzksnark_verifier_strong_IC;
-    using libsnark::r1cs_gg_ppzksnark_verifier_weak_IC;
-
-    typedef libff::Fr<ppT> FieldT;
-
-    protoboard<FieldT> pbA;
-
-    // 1) Allocate PUBLIC  (S, P, D), set_input_sizes(3)
-    //    - S: a+b
-    //    - P: a*b
-    //    - D: (a-b)^2
-    pb_variable<FieldT> S, P, D;
-    S.allocate(pbA, "S");
-    P.allocate(pbA, "P");
-    D.allocate(pbA, "D");
-    pbA.set_input_sizes(3);
-
-    // 2) PRIVATE
-    pb_variable<FieldT> a, b, t_sum, t_diff;
-    a.allocate(pbA, "a");
-    b.allocate(pbA, "b");
-    t_sum.allocate(pbA, "t_sum");
-    t_diff.allocate(pbA, "t_diff");
-
-    // 3) Constraints
-    // t_sum = a + b
-    pbA.add_r1cs_constraint(r1cs_constraint<FieldT>(t_sum - a - b, 1, 0));
-    // S = t_sum
-    pbA.add_r1cs_constraint(r1cs_constraint<FieldT>(S - t_sum, 1, 0));
-    // a * b = P
-    pbA.add_r1cs_constraint(r1cs_constraint<FieldT>(a, b, P));
-    // t_diff = a - b
-    pbA.add_r1cs_constraint(r1cs_constraint<FieldT>(t_diff - (a - b), 1, 0));
-    // t_diff^2 = D
-    pbA.add_r1cs_constraint(r1cs_constraint<FieldT>(t_diff, t_diff, D));
-
-    // 4)  witness (a=3, b=5 ⇒ S=8, P=15, D=4)
-    pbA.val(a) = FieldT("3");
-    pbA.val(b) = FieldT("5");
-    pbA.val(t_sum)  = pbA.val(a) + pbA.val(b);                  // 8
-    pbA.val(S)      = pbA.val(t_sum);
-    pbA.val(P)      = pbA.val(a) * pbA.val(b);                  // 15
-    pbA.val(t_diff) = pbA.val(a) - pbA.val(b);                  // -2
-    pbA.val(D)      = pbA.val(t_diff) * pbA.val(t_diff);        // 4
-
-    std::cout << "\n[A] Sorting network demo (fixed)\n";
-    std::cout << " [A] is_satisfied = " << (pbA.is_satisfied() ? "yes" : "no") << std::endl;
-
-    // 5) Keygen/Prove/Verify with correct primary/aux of pbA
-    const auto csA = pbA.get_constraint_system();
-    const auto keypairA = r1cs_gg_ppzksnark_generator<ppT>(csA);
-
-    const auto primary_input_A   = pbA.primary_input();    // 3 public (S,P,D)
-    const auto auxiliary_input_A = pbA.auxiliary_input();
-
-    const auto proofA = r1cs_gg_ppzksnark_prover(keypairA.pk, primary_input_A, auxiliary_input_A);
-
-    const bool A_strong = r1cs_gg_ppzksnark_verifier_strong_IC(keypairA.vk, primary_input_A, proofA);
-    const bool A_weak   = r1cs_gg_ppzksnark_verifier_weak_IC  (keypairA.vk, primary_input_A, proofA);
-
-    std::cout << "A: Verified strong_IC=" << (A_strong ? "true":"false")
-              << " | weak_IC=" << (A_weak ? "true":"false") << std::endl;
-
-
-    std::cout << "A=" << ((A_strong && A_weak) ? 1 : 0) << std::endl;
-}
-
-
-// ------------------------------------------------------------
-// (B) Verify-sorted:
-//  Public: r (challenge), B[1..4]
-//  Private: A[1..4]
-//  Constraints:
-//   - Monotonicity: B[i] <= B[i+1]
-//   - Multiset equality: prod(r + A[i]) == prod(r + B[i])
-// ------------------------------------------------------------
-bool run_example_B_verify_sorted(const std::vector<size_t> &A_vals, const std::vector<size_t> &B_vals, size_t k_bits, size_t r_chal) {
-    std::cout << "\n[B] Verify-sorted demo" << std::endl;
-
+// ---------- [B] Verify that B is a correct sorted version of A ----------
+template<typename ppT>
+void run_verify_sorted_demo_B_full(size_t k_bits)
+{
+    using FieldT = libff::Fr<ppT>;
     protoboard<FieldT> pb;
 
-    // --- Public: r, B1..B4
-    pb_variable<FieldT> r; r.allocate(pb, "r");
-    pb_variable<FieldT> B1, B2, B3, B4;
-    B1.allocate(pb, "B1"); B2.allocate(pb, "B2");
-    B3.allocate(pb, "B3"); B4.allocate(pb, "B4");
-    pb.set_input_sizes(1 + 4);
-
-    // --- Private: A1..A4
+    // Public values
     pb_variable<FieldT> A1, A2, A3, A4;
+    pb_variable<FieldT> B1, B2, B3, B4;
     A1.allocate(pb, "A1"); A2.allocate(pb, "A2");
     A3.allocate(pb, "A3"); A4.allocate(pb, "A4");
+    B1.allocate(pb, "B1"); B2.allocate(pb, "B2");
+    B3.allocate(pb, "B3"); B4.allocate(pb, "B4");
+    pb.set_input_sizes(8);  // public inputs: A1..A4, B1..B4
 
-    // Monotonicity gadgets: ensure NOT (B[i] > B[i+1])
-    less_than_wrap_gadget<FieldT> lt10(pb, B2, B1, k_bits, "B2_lt_B1");
-    less_than_wrap_gadget<FieldT> lt21(pb, B3, B2, k_bits, "B3_lt_B2");
-    less_than_wrap_gadget<FieldT> lt32(pb, B4, B3, k_bits, "B4_lt_B3");
+    // Range gadgets for sorted B
+    pb_variable<FieldT> t12, t23, t34;
+    t12.allocate(pb, "t12"); t23.allocate(pb, "t23"); t34.allocate(pb, "t34");
+    kbits_range_manual<FieldT> t12_rng(pb, t12, k_bits, "t12_rng");
+    kbits_range_manual<FieldT> t23_rng(pb, t23, k_bits, "t23_rng");
+    kbits_range_manual<FieldT> t34_rng(pb, t34, k_bits, "t34_rng");
 
-    auto enforce_zero = [&](const pb_variable<FieldT> &v, const std::string &tag){
-        pb.add_r1cs_constraint(r1cs_constraint<FieldT>(v, FieldT::one(), FieldT::zero()), tag);
-    };
+    // --- 1️⃣ Monotonicity check: ensure B1 ≤ B2 ≤ B3 ≤ B4 ---
+    pb.add_r1cs_constraint(r1cs_constraint<FieldT>(1, B2 - B1, t12), "t12 = B2 - B1");
+    pb.add_r1cs_constraint(r1cs_constraint<FieldT>(1, B3 - B2, t23), "t23 = B3 - B2");
+    pb.add_r1cs_constraint(r1cs_constraint<FieldT>(1, B4 - B3, t34), "t34 = B4 - B3");
 
-    // Grand product variables
-    pb_variable<FieldT> PA0, PA1v, PA2v, PA3v, PA4v; // rolling product for A
-    pb_variable<FieldT> PB0, PB1v, PB2v, PB3v, PB4v; // rolling product for B
-    PA0.allocate(pb, "PA0"); PA1v.allocate(pb, "PA1"); PA2v.allocate(pb, "PA2"); PA3v.allocate(pb, "PA3"); PA4v.allocate(pb, "PA4");
-    PB0.allocate(pb, "PB0"); PB1v.allocate(pb, "PB1"); PB2v.allocate(pb, "PB2"); PB3v.allocate(pb, "PB3"); PB4v.allocate(pb, "PB4");
+    t12_rng.generate_r1cs_constraints();
+    t23_rng.generate_r1cs_constraints();
+    t34_rng.generate_r1cs_constraints();
 
-    // Constraints
-    lt10.generate_r1cs_constraints();
-    lt21.generate_r1cs_constraints();
-    lt32.generate_r1cs_constraints();
+    // --- 2️⃣ Multiset equality check: ∏(r + A[i]) = ∏(r + B[i]) ---
+    const FieldT r = FieldT("12345"); // public challenge constant
 
-    enforce_zero(lt10.lt, "enf_B1<=B2");
-    enforce_zero(lt21.lt, "enf_B2<=B3");
-    enforce_zero(lt32.lt, "enf_B3<=B4");
+    // Intermediate variables for partial products
+    pb_variable<FieldT> pA12, pA34, pB12, pB34;
+    pA12.allocate(pb, "pA12"); pA34.allocate(pb, "pA34");
+    pB12.allocate(pb, "pB12"); pB34.allocate(pb, "pB34");
 
-    // Initialize PA0 = 1, PB0 = 1
-    pb.add_r1cs_constraint(r1cs_constraint<FieldT>(PA0 - FieldT::one(), FieldT::one(), FieldT::zero()), "PA0=1");
-    pb.add_r1cs_constraint(r1cs_constraint<FieldT>(PB0 - FieldT::one(), FieldT::one(), FieldT::zero()), "PB0=1");
+    pb_variable<FieldT> prodA, prodB;
+    prodA.allocate(pb, "prodA");
+    prodB.allocate(pb, "prodB");
 
-    // Rolling products: PAi = PA(i-1) * (r + Ai)
-    auto mul_step = [&](const pb_variable<FieldT> &prev, const pb_variable<FieldT> &term, const pb_variable<FieldT> &out, const std::string &tag){
-        pb.add_r1cs_constraint(r1cs_constraint<FieldT>(prev, r + term, out), tag);
-    };
-    mul_step(PA0, A1, PA1v, "PA1");
-    mul_step(PA1v, A2, PA2v, "PA2");
-    mul_step(PA2v, A3, PA3v, "PA3");
-    mul_step(PA3v, A4, PA4v, "PA4");
+    // Step 1: (r + Ai) * (r + Aj)
+    pb.add_r1cs_constraint(
+        r1cs_constraint<FieldT>(A1 + r, A2 + r, pA12),
+        "pA12 = (r+A1)*(r+A2)");
+    pb.add_r1cs_constraint(
+        r1cs_constraint<FieldT>(A3 + r, A4 + r, pA34),
+        "pA34 = (r+A3)*(r+A4)");
 
-    mul_step(PB0, B1, PB1v, "PB1");
-    mul_step(PB1v, B2, PB2v, "PB2");
-    mul_step(PB2v, B3, PB3v, "PB3");
-    mul_step(PB3v, B4, PB4v, "PB4");
+    pb.add_r1cs_constraint(
+        r1cs_constraint<FieldT>(B1 + r, B2 + r, pB12),
+        "pB12 = (r+B1)*(r+B2)");
+    pb.add_r1cs_constraint(
+        r1cs_constraint<FieldT>(B3 + r, B4 + r, pB34),
+        "pB34 = (r+B3)*(r+B4)");
 
-    // Enforce PA4 == PB4
-    pb.add_r1cs_constraint(r1cs_constraint<FieldT>(PA4v - PB4v, FieldT::one(), FieldT::zero()), "eq_PA4_PB4");
+    // Step 2: combine partials
+    pb.add_r1cs_constraint(
+        r1cs_constraint<FieldT>(pA12, pA34, prodA),
+        "prodA = pA12 * pA34");
+    pb.add_r1cs_constraint(
+        r1cs_constraint<FieldT>(pB12, pB34, prodB),
+        "prodB = pB12 * pB34");
 
-    // Witness assignment
-    pb.val(r)  = FieldT(r_chal);
-    pb.val(A1) = FieldT(A_vals[0]); pb.val(A2) = FieldT(A_vals[1]);
-    pb.val(A3) = FieldT(A_vals[2]); pb.val(A4) = FieldT(A_vals[3]);
-    pb.val(B1) = FieldT(B_vals[0]); pb.val(B2) = FieldT(B_vals[1]);
-    pb.val(B3) = FieldT(B_vals[2]); pb.val(B4) = FieldT(B_vals[3]);
+    // Step 3: enforce equality
+    pb.add_r1cs_constraint(
+        r1cs_constraint<FieldT>(1, prodA, prodB),
+        "∏(r + A[i]) = ∏(r + B[i])");
 
-    // Run lt gadgets to fill lt and z witnesses
-    lt10.generate_r1cs_witness();
-    lt21.generate_r1cs_witness();
-    lt32.generate_r1cs_witness();
+    // --- Witness assignment ---
+    uint64_t A_vals[4] = {35, 12, 12, 200};
+    uint64_t B_vals[4] = {12, 12, 35, 200};
 
-    // Init PA0, PB0
-    pb.val(PA0) = FieldT::one();
-    pb.val(PB0) = FieldT::one();
+    pb.val(A1) = FieldT(A_vals[0]);
+    pb.val(A2) = FieldT(A_vals[1]);
+    pb.val(A3) = FieldT(A_vals[2]);
+    pb.val(A4) = FieldT(A_vals[3]);
+    pb.val(B1) = FieldT(B_vals[0]);
+    pb.val(B2) = FieldT(B_vals[1]);
+    pb.val(B3) = FieldT(B_vals[2]);
+    pb.val(B4) = FieldT(B_vals[3]);
 
-    // Compute rolling products (witness)
-    pb.val(PA1v) = pb.val(PA0) * (pb.val(r) + pb.val(A1));
-    pb.val(PA2v) = pb.val(PA1v) * (pb.val(r) + pb.val(A2));
-    pb.val(PA3v) = pb.val(PA2v) * (pb.val(r) + pb.val(A3));
-    pb.val(PA4v) = pb.val(PA3v) * (pb.val(r) + pb.val(A4));
+    // Compute differences for monotonicity
+    t12_rng.witness_from_uint64(B_vals[1] - B_vals[0]);
+    t23_rng.witness_from_uint64(B_vals[2] - B_vals[1]);
+    t34_rng.witness_from_uint64(B_vals[3] - B_vals[2]);
 
-    pb.val(PB1v) = pb.val(PB0) * (pb.val(r) + pb.val(B1));
-    pb.val(PB2v) = pb.val(PB1v) * (pb.val(r) + pb.val(B2));
-    pb.val(PB3v) = pb.val(PB2v) * (pb.val(r) + pb.val(B3));
-    pb.val(PB4v) = pb.val(PB3v) * (pb.val(r) + pb.val(B4));
+    // Compute product values
+    FieldT pA_12 = (r + FieldT(A_vals[0])) * (r + FieldT(A_vals[1]));
+    FieldT pA_34 = (r + FieldT(A_vals[2])) * (r + FieldT(A_vals[3]));
+    FieldT pB_12 = (r + FieldT(B_vals[0])) * (r + FieldT(B_vals[1]));
+    FieldT pB_34 = (r + FieldT(B_vals[2])) * (r + FieldT(B_vals[3]));
 
-    std::cout << " [B] is_satisfied = " << (pb.is_satisfied() ? "yes" : "no") << std::endl;
+    pb.val(pA12) = pA_12;
+    pb.val(pA34) = pA_34;
+    pb.val(pB12) = pB_12;
+    pb.val(pB34) = pB_34;
 
-    // ---- Prove / Verify (cache inputs!) ----
-    const r1cs_constraint_system<FieldT> cs = pb.get_constraint_system();
-    const auto primary_input   = pb.primary_input();
-    const auto auxiliary_input = pb.auxiliary_input();
+    pb.val(prodA) = pA_12 * pA_34;
+    pb.val(prodB) = pB_12 * pB_34;
 
-    auto keypair = r1cs_gg_ppzksnark_generator<ppT>(cs);
-    auto proof   = r1cs_gg_ppzksnark_prover<ppT>(keypair.pk, primary_input, auxiliary_input);
+    // --- Verify ---
+    std::cout << "[B-full] is_satisfied = "
+              << (pb.is_satisfied() ? "yes" : "no") << std::endl;
 
-    const bool ok_strong = r1cs_gg_ppzksnark_verifier_strong_IC<ppT>(keypair.vk, primary_input, proof);
-    const bool ok_weak   = r1cs_gg_ppzksnark_verifier_weak_IC  <ppT>(keypair.vk, primary_input, proof);
+    const auto keypair = r1cs_gg_ppzksnark_generator<ppT>(pb.get_constraint_system());
+    const auto proof   = r1cs_gg_ppzksnark_prover<ppT>(
+        keypair.pk, pb.primary_input(), pb.auxiliary_input());
+    const bool ok_str  = r1cs_gg_ppzksnark_verifier_strong_IC<ppT>(
+        keypair.vk, pb.primary_input(), proof);
+    const bool ok_weak = r1cs_gg_ppzksnark_verifier_weak_IC<ppT>(
+        keypair.vk, pb.primary_input(), proof);
 
-    std::cout << "B: Verified strong_IC=" << (ok_strong ? "true" : "false")
+    std::cout << "B-full: Verified strong_IC=" << (ok_str ? "true" : "false")
               << " | weak_IC=" << (ok_weak ? "true" : "false") << std::endl;
-    return ok_strong;
 }
 
-int main() {
-    libff::start_profiling();
-    ppT::init_public_params();
 
-    const size_t k_bits = 16; // 16-bit (< log2(Field modulus))
+int main()
+{
+    default_r1cs_gg_ppzksnark_pp::init_public_params();
 
-    // Test data
-    std::vector<size_t> A = {35, 12, 12, 200};
-    std::vector<size_t> B = A; std::sort(B.begin(), B.end());
+    const size_t k_bits = 16; // change to 32/64 if needed (< 2^k)
 
-    bool okA = run_example_A_sorting_network_4(A, k_bits);
+    std::cout << "[100%] Built target zk_sort_example\n";
+    std::cout << "Reset time counters for profiling\n\n";
 
-    // Challenge r (Fiat–Shamir). Demo: r = 12345
-    bool okB = run_example_B_verify_sorted(A, B, k_bits, /*r=*/12345);
+    std::cout << "[A] Sorting network demo\n";
+    run_sorting_network_demo_A<default_r1cs_gg_ppzksnark_pp>(k_bits);
 
-    std::cout << "\nAll done. A=" << okA << ", B=" << okB << std::endl;
-    return (okA && okB) ? 0 : 1;
+    std::cout << "\n[B] Verify-sorted demo\n";
+    run_verify_sorted_demo_B_full<default_r1cs_gg_ppzksnark_pp>(k_bits);
+
+    std::cout << "\nAll done.\n";
+    return 0;
 }
