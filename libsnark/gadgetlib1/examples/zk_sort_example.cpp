@@ -1,12 +1,18 @@
 // MIT License
-// Sorting-network zkSNARK demo without packing_gadgets.hpp
-// Range checks are manual: boolean bits + linear combination equals the packed value.
+// Generic sorting-network zkSNARK demo (odd-even mergesort) + Verify-sorted (generic N)
+// Range checks are manual (k-bit): boolean bits + linear combination equals the packed value.
+// Extra constraints added: selector-equality, output monotonicity, sum/sum-of-squares preservation,
+// double-(r + ·) product checks for multiset equality in B.
 // (c) 2025
 
 #include <iostream>
 #include <vector>
-#include <algorithm>
+#include <utility>
+#include <memory>
 #include <cstdint>
+#include <string>
+#include <stdexcept>
+#include <algorithm>
 
 #include <libsnark/common/default_types/r1cs_gg_ppzksnark_pp.hpp>
 #include <libsnark/gadgetlib1/protoboard.hpp>
@@ -16,14 +22,14 @@
 using namespace libsnark;
 using namespace std;
 
-// ---------- Manual k-bit "range" gadget: bits are boolean and sum(bits*2^i) = x ----------
+// ---------- Manual k-bit "range" gadget ----------
 template<typename FieldT>
 struct kbits_range_manual {
     protoboard<FieldT>& pb;
     pb_variable<FieldT> x;
     size_t k;
     pb_variable_array<FieldT> bits;
-    std::vector<FieldT> weights; // 2^i precomputed
+    std::vector<FieldT> weights;
 
     kbits_range_manual(protoboard<FieldT>& pb,
                        const pb_variable<FieldT>& x,
@@ -45,7 +51,6 @@ struct kbits_range_manual {
         for (size_t i = 0; i < k; i++) {
             generate_boolean_r1cs_constraint<FieldT>(pb, bits[i], "bit");
         }
-        // sum_i bits[i]*2^i = x   ⇒  1 * x = sum
         linear_combination<FieldT> sum;
         for (size_t i = 0; i < k; i++) sum.add_term(bits[i], weights[i]);
         pb.add_r1cs_constraint(r1cs_constraint<FieldT>(1, x, sum), "pack_bits");
@@ -86,33 +91,31 @@ struct cmp_swap_gadget {
     }
 
     void generate_r1cs_constraints() {
+        // s boolean
         generate_boolean_r1cs_constraint<FieldT>(pb, s, "sel_boolean");
 
-        // u - y = s * (x - y)   (valid R1CS: (a= s) * (b= x-y) = (c= u-y))
-        pb.add_r1cs_constraint(
-            r1cs_constraint<FieldT>(s, x - y, u - y),
-            "u - y = s*(x - y)");
+        // Original constraints
+        pb.add_r1cs_constraint(r1cs_constraint<FieldT>(s, x - y, u - y), "u - y = s*(x - y)");
+        pb.add_r1cs_constraint(r1cs_constraint<FieldT>(1, v, x + y - u), "v = x + y - u");
+        pb.add_r1cs_constraint(r1cs_constraint<FieldT>(1, v - u, t),      "t = v - u");
 
-        // v = x + y - u        ⇒ 1 * v = x + y - u
-        pb.add_r1cs_constraint(
-            r1cs_constraint<FieldT>(1, v, x + y - u),
-            "v = x + y - u");
+        // Extra constraints (strong selector semantics + sum preservation)
+        // When s=1 => u=x and v=y; when s=0 => u=y and v=x
+        pb.add_r1cs_constraint(r1cs_constraint<FieldT>(s,     u - x, 0), "s*(u-x)=0");
+        pb.add_r1cs_constraint(r1cs_constraint<FieldT>(1 - s, u - y, 0), "(1-s)*(u-y)=0");
+        pb.add_r1cs_constraint(r1cs_constraint<FieldT>(s,     v - y, 0), "s*(v-y)=0");
+        pb.add_r1cs_constraint(r1cs_constraint<FieldT>(1 - s, v - x, 0), "(1-s)*(v-x)=0");
 
-        // t = v - u            ⇒ 1 * (v - u) = t
-        pb.add_r1cs_constraint(
-            r1cs_constraint<FieldT>(1, v - u, t),
-            "t = v - u");
-        // t range is enforced outside by t_rng
+        // u + v = x + y
+        pb.add_r1cs_constraint(r1cs_constraint<FieldT>(1, u + v, x + y), "sum_preserved_cmp");
     }
 
     void generate_r1cs_witness(uint64_t x_u64, uint64_t y_u64) {
         const bool sel = (x_u64 <= y_u64);
         pb.val(s) = sel ? FieldT::one() : FieldT::zero();
-
         u_u64 = sel ? x_u64 : y_u64;
         v_u64 = x_u64 + y_u64 - u_u64;
         t_u64 = v_u64 - u_u64;
-
         pb.val(u) = FieldT(u_u64);
         pb.val(v) = FieldT(v_u64);
         pb.val(t) = FieldT(t_u64);
@@ -120,293 +123,417 @@ struct cmp_swap_gadget {
     }
 };
 
-// ---------- [A] 4-input odd-even sorting network with full k-bit range checks ----------
+// ---------- Odd-even mergesort comparator list ----------
+static void oddeven_merge_build(std::vector<std::pair<size_t,size_t>>& comps,
+                                size_t lo, size_t n, size_t r) {
+    size_t m = r * 2;
+    if (m < n) {
+        oddeven_merge_build(comps, lo,     n, m);
+        oddeven_merge_build(comps, lo + r, n, m);
+        for (size_t i = lo + r; i + r < lo + n; i += m) {
+            comps.push_back(std::make_pair(i, i + r));
+        }
+    } else {
+        comps.push_back(std::make_pair(lo, lo + r));
+    }
+}
+static void oddeven_mergesort_build(std::vector<std::pair<size_t,size_t>>& comps,
+                                    size_t lo, size_t n) {
+    if (n > 1) {
+        size_t m = n / 2;
+        oddeven_mergesort_build(comps, lo,     m);
+        oddeven_mergesort_build(comps, lo + m, m);
+        oddeven_merge_build(comps, lo, n, 1);
+    }
+}
+static std::vector<std::vector<std::pair<size_t,size_t>>> to_layers_greedy(
+    const std::vector<std::pair<size_t,size_t>>& comps) {
+    std::vector<std::vector<std::pair<size_t,size_t>>> layers;
+    for (size_t idx = 0; idx < comps.size(); ++idx) {
+        size_t i = comps[idx].first;
+        size_t j = comps[idx].second;
+        bool placed = false;
+        if (!layers.empty()) {
+            std::vector<std::pair<size_t,size_t>>& L = layers.back();
+            bool conflict = false;
+            for (size_t t = 0; t < L.size(); ++t) {
+                size_t a = L[t].first, b = L[t].second;
+                if (a == i || a == j || b == i || b == j) { conflict = true; break; }
+            }
+            if (!conflict) { L.push_back(std::make_pair(i,j)); placed = true; }
+        }
+        if (!placed) { layers.push_back(std::vector<std::pair<size_t,size_t>>(1, std::make_pair(i,j))); }
+    }
+    return layers;
+}
+
+// ---------- Product tree for ∏(r + X[i]) ----------
+template<typename FieldT>
+struct product_tree {
+    protoboard<FieldT>& pb;
+    const FieldT r;
+    size_t k_bits;
+
+    std::vector<pb_variable<FieldT>> leaves_vars;
+    std::vector<std::vector<pb_variable<FieldT>>> layers_vars;
+
+    product_tree(protoboard<FieldT>& pb, const FieldT& r, size_t k_bits)
+        : pb(pb), r(r), k_bits(k_bits) {}
+
+    void make_leaves_from_array(const std::vector<pb_variable<FieldT>>& X,
+                                const std::string& tag) {
+        leaves_vars.resize(X.size());
+        for (size_t i = 0; i < X.size(); ++i) {
+            leaves_vars[i].allocate(pb, tag + "_leaf_" + std::to_string(i));
+            pb.add_r1cs_constraint(r1cs_constraint<FieldT>(1, leaves_vars[i], X[i] + r),
+                                   tag + "_leaf_equiv");
+        }
+    }
+
+    pb_variable<FieldT> build_constraints(const std::string& tag) {
+        layers_vars.clear();
+        layers_vars.push_back(leaves_vars);
+        size_t level = 0;
+        while (layers_vars.back().size() > 1) {
+            const std::vector<pb_variable<FieldT>>& cur = layers_vars.back();
+            std::vector<pb_variable<FieldT>> nxt;
+            for (size_t i = 0; i < cur.size(); i += 2) {
+                if (i + 1 < cur.size()) {
+                    pb_variable<FieldT> p; p.allocate(pb, tag + "_lvl" + std::to_string(level) +
+                                                            "_mul_" + std::to_string(i/2));
+                    pb.add_r1cs_constraint(r1cs_constraint<FieldT>(cur[i], cur[i+1], p),
+                                           tag + "_pair_mul");
+                    nxt.push_back(p);
+                } else {
+                    pb_variable<FieldT> carry;
+                    carry.allocate(pb, tag + "_lvl" + std::to_string(level) + "_carry");
+                    pb.add_r1cs_constraint(r1cs_constraint<FieldT>(1, carry, cur[i]),
+                                           tag + "_carry_forward");
+                    nxt.push_back(carry);
+                }
+            }
+            layers_vars.push_back(nxt);
+            ++level;
+        }
+        return layers_vars.back()[0];
+    }
+
+    void assign_witness_from_uints(const std::vector<uint64_t>& X_vals) {
+        for (size_t i = 0; i < X_vals.size(); ++i) {
+            pb.val(leaves_vars[i]) = FieldT(X_vals[i]) + r;
+        }
+        for (size_t L = 0; L + 1 < layers_vars.size(); ++L) {
+            const std::vector<pb_variable<FieldT>>& cur = layers_vars[L];
+            const std::vector<pb_variable<FieldT>>& nxt = layers_vars[L+1];
+            size_t nxt_idx = 0;
+            for (size_t i = 0; i < cur.size(); i += 2) {
+                if (i + 1 < cur.size()) pb.val(nxt[nxt_idx]) = pb.val(cur[i]) * pb.val(cur[i+1]);
+                else                     pb.val(nxt[nxt_idx]) = pb.val(cur[i]);
+                ++nxt_idx;
+            }
+        }
+    }
+};
+
+// ---------- [A] Sorting-network with extra constraints ----------
 template<typename ppT>
-void run_sorting_network_demo_A(size_t k_bits)
+void run_sorting_network_demo_generic(size_t k_bits, const std::vector<uint64_t>& arr)
 {
     using FieldT = libff::Fr<ppT>;
+    const size_t N = arr.size();
+    if ((N & (N-1)) != 0) throw std::runtime_error("Array size must be a power of two.");
+
     protoboard<FieldT> pb;
 
-    // Public outputs Y1..Y4 (primary)
-    pb_variable<FieldT> Y1, Y2, Y3, Y4;
-    Y1.allocate(pb, "Y1");
-    Y2.allocate(pb, "Y2");
-    Y3.allocate(pb, "Y3");
-    Y4.allocate(pb, "Y4");
-    pb.set_input_sizes(4);
+    // Public outputs Y
+    std::vector<pb_variable<FieldT>> Y(N);
+    for (size_t i = 0; i < N; ++i) Y[i].allocate(pb, "Y" + std::to_string(i));
+    pb.set_input_sizes(N);
 
-    // Private inputs A1..A4
-    pb_variable<FieldT> A1, A2, A3, A4;
-    A1.allocate(pb, "A1");
-    A2.allocate(pb, "A2");
-    A3.allocate(pb, "A3");
-    A4.allocate(pb, "A4");
+    // Private inputs A + range
+    std::vector<pb_variable<FieldT>> A(N);
+    std::vector<std::unique_ptr<kbits_range_manual<FieldT>>> A_rng(N);
+    for (size_t i = 0; i < N; ++i) {
+        A[i].allocate(pb, "A" + std::to_string(i));
+        A_rng[i].reset(new kbits_range_manual<FieldT>(pb, A[i], k_bits, "A"+std::to_string(i)+"_rng"));
+    }
 
-    // Range constraints for inputs
-    kbits_range_manual<FieldT> A1_rng(pb, A1, k_bits, "A1_rng");
-    kbits_range_manual<FieldT> A2_rng(pb, A2, k_bits, "A2_rng");
-    kbits_range_manual<FieldT> A3_rng(pb, A3, k_bits, "A3_rng");
-    kbits_range_manual<FieldT> A4_rng(pb, A4, k_bits, "A4_rng");
+    // Build network
+    std::vector<std::pair<size_t,size_t>> comps;
+    oddeven_mergesort_build(comps, 0, N);
+    std::vector<std::vector<std::pair<size_t,size_t>>> layers = to_layers_greedy(comps);
 
-    // Intermediates
-    pb_variable<FieldT> b1, b2, b3, b4;
-    pb_variable<FieldT> c1, c2, c3, c4;
-    pb_variable<FieldT> d2, d3;
+    struct CompEntry {
+        size_t i, j;
+        pb_variable<FieldT> u, v;
+        std::unique_ptr<cmp_swap_gadget<FieldT>> cmp;
+        std::unique_ptr<kbits_range_manual<FieldT>> t_rng, u_rng, v_rng;
+    };
+    std::vector<pb_variable<FieldT>> cur_vars = A;
+    std::vector<std::vector<std::unique_ptr<CompEntry>>> network; network.resize(layers.size());
 
-    b1.allocate(pb, "b1"); b2.allocate(pb, "b2"); b3.allocate(pb, "b3"); b4.allocate(pb, "b4");
-    c1.allocate(pb, "c1"); c2.allocate(pb, "c2"); c3.allocate(pb, "c3"); c4.allocate(pb, "c4");
-    d2.allocate(pb, "d2"); d3.allocate(pb, "d3");
+    for (size_t L = 0; L < layers.size(); ++L) {
+        std::vector<pb_variable<FieldT>> next_vars = cur_vars;
+        for (size_t e = 0; e < layers[L].size(); ++e) {
+            size_t i = layers[L][e].first, j = layers[L][e].second;
+            std::unique_ptr<CompEntry> ce(new CompEntry());
+            ce->i = i; ce->j = j;
+            ce->u.allocate(pb, "w_L"+std::to_string(L)+"_i"+std::to_string(i)+"_u");
+            ce->v.allocate(pb, "w_L"+std::to_string(L)+"_j"+std::to_string(j)+"_v");
+            ce->cmp.reset(new cmp_swap_gadget<FieldT>(pb, k_bits, cur_vars[i], cur_vars[j], ce->u, ce->v,
+                            "cmp_L"+std::to_string(L)+"_"+std::to_string(i)+"_"+std::to_string(j), NULL));
+            ce->t_rng.reset(new kbits_range_manual<FieldT>(pb, ce->cmp->t, k_bits, "cmp_L"+std::to_string(L)+"_t_rng"));
+            ce->cmp->t_rng = ce->t_rng.get();
+            ce->u_rng.reset(new kbits_range_manual<FieldT>(pb, ce->u, k_bits, "u_rng_L"+std::to_string(L)+"_"+std::to_string(i)));
+            ce->v_rng.reset(new kbits_range_manual<FieldT>(pb, ce->v, k_bits, "v_rng_L"+std::to_string(L)+"_"+std::to_string(j)));
+            next_vars[i] = ce->u; next_vars[j] = ce->v;
+            network[L].push_back(std::move(ce));
+        }
+        cur_vars = next_vars;
+    }
 
-    // Range gadgets for all intermediates
-    kbits_range_manual<FieldT> b1_rng(pb, b1, k_bits, "b1_rng");
-    kbits_range_manual<FieldT> b2_rng(pb, b2, k_bits, "b2_rng");
-    kbits_range_manual<FieldT> b3_rng(pb, b3, k_bits, "b3_rng");
-    kbits_range_manual<FieldT> b4_rng(pb, b4, k_bits, "b4_rng");
-    kbits_range_manual<FieldT> c1_rng(pb, c1, k_bits, "c1_rng");
-    kbits_range_manual<FieldT> c2_rng(pb, c2, k_bits, "c2_rng");
-    kbits_range_manual<FieldT> c3_rng(pb, c3, k_bits, "c3_rng");
-    kbits_range_manual<FieldT> c4_rng(pb, c4, k_bits, "c4_rng");
-    kbits_range_manual<FieldT> d2_rng(pb, d2, k_bits, "d2_rng");
-    kbits_range_manual<FieldT> d3_rng(pb, d3, k_bits, "d3_rng");
+    // Output monotonicity: Ty[i] = Y[i+1] - Y[i] >= 0
+    std::vector<pb_variable<FieldT>> Ty(N > 0 ? N-1 : 0);
+    std::vector<std::unique_ptr<kbits_range_manual<FieldT>>> Ty_rng(N > 0 ? N-1 : 0);
+    for (size_t i = 0; i + 1 < N; ++i) {
+        Ty[i].allocate(pb, "Ty"+std::to_string(i));
+        pb.add_r1cs_constraint(r1cs_constraint<FieldT>(1, Y[i+1] - Y[i], Ty[i]), "Ty=Y[i+1]-Y[i]");
+        Ty_rng[i].reset(new kbits_range_manual<FieldT>(pb, Ty[i], k_bits, "Ty"+std::to_string(i)+"_rng"));
+    }
 
-    // Stage 1: (A1,A2)->(b1,b2), (A3,A4)->(b3,b4)
-    cmp_swap_gadget<FieldT> cmp12(pb, k_bits, A1, A2, b1, b2, "cmp12", nullptr);
-    cmp_swap_gadget<FieldT> cmp34(pb, k_bits, A3, A4, b3, b4, "cmp34", nullptr);
+    // Sum(Y) = Sum(A)
+    linear_combination<FieldT> sumA, sumY;
+    for (size_t i = 0; i < N; ++i) { sumA.add_term(A[i], 1); sumY.add_term(Y[i], 1); }
+    pb.add_r1cs_constraint(r1cs_constraint<FieldT>(1, sumY, sumA), "sum_preserved_all");
 
-    // Stage 2: (b1,b3)->(c1,c3), (b2,b4)->(c2,c4)
-    cmp_swap_gadget<FieldT> cmp13(pb, k_bits, b1, b3, c1, c3, "cmp13", nullptr);
-    cmp_swap_gadget<FieldT> cmp24(pb, k_bits, b2, b4, c2, c4, "cmp24", nullptr);
+    // Sum of squares preserved
+    std::vector<pb_variable<FieldT>> A2(N), Y2(N);
+    for (size_t i = 0; i < N; ++i) { A2[i].allocate(pb, "A2_"+std::to_string(i)); Y2[i].allocate(pb, "Y2_"+std::to_string(i)); }
+    for (size_t i = 0; i < N; ++i) {
+        pb.add_r1cs_constraint(r1cs_constraint<FieldT>(A[i], A[i], A2[i]), "A2=A*A");
+        pb.add_r1cs_constraint(r1cs_constraint<FieldT>(Y[i], Y[i], Y2[i]), "Y2=Y*Y");
+    }
+    linear_combination<FieldT> sumA2, sumY2;
+    for (size_t i = 0; i < N; ++i) { sumA2.add_term(A2[i], 1); sumY2.add_term(Y2[i], 1); }
+    pb.add_r1cs_constraint(r1cs_constraint<FieldT>(1, sumY2, sumA2), "sum_squares_preserved");
 
-    // Stage 3: (c2,c3)->(d2,d3)
-    cmp_swap_gadget<FieldT> cmp23(pb, k_bits, c2, c3, d2, d3, "cmp23", nullptr);
+    // Generate constraints
+    for (size_t i = 0; i < N; ++i) A_rng[i]->generate_r1cs_constraints();
+    for (size_t L = 0; L < network.size(); ++L)
+        for (size_t e = 0; e < network[L].size(); ++e) {
+            std::unique_ptr<CompEntry>& ce_ptr = network[L][e];
+            ce_ptr->cmp->generate_r1cs_constraints();
+            ce_ptr->t_rng->generate_r1cs_constraints();
+            ce_ptr->u_rng->generate_r1cs_constraints();
+            ce_ptr->v_rng->generate_r1cs_constraints();
+        }
+    for (size_t i = 0; i + 1 < N; ++i) Ty_rng[i]->generate_r1cs_constraints();
 
-    // t-range gadgets (now that t vars exist)
-    kbits_range_manual<FieldT> cmp12_t_rng(pb, cmp12.t, k_bits, "cmp12.t_rng"); cmp12.t_rng = &cmp12_t_rng;
-    kbits_range_manual<FieldT> cmp34_t_rng(pb, cmp34.t, k_bits, "cmp34.t_rng"); cmp34.t_rng = &cmp34_t_rng;
-    kbits_range_manual<FieldT> cmp13_t_rng(pb, cmp13.t, k_bits, "cmp13.t_rng"); cmp13.t_rng = &cmp13_t_rng;
-    kbits_range_manual<FieldT> cmp24_t_rng(pb, cmp24.t, k_bits, "cmp24.t_rng"); cmp24.t_rng = &cmp24_t_rng;
-    kbits_range_manual<FieldT> cmp23_t_rng(pb, cmp23.t, k_bits, "cmp23.t_rng"); cmp23.t_rng = &cmp23_t_rng;
+    // Link Y to final wires
+    for (size_t i = 0; i < N; ++i)
+        pb.add_r1cs_constraint(r1cs_constraint<FieldT>(1, Y[i], cur_vars[i]), "Y_equals_out_"+std::to_string(i));
 
-    // Constraints
-    A1_rng.generate_r1cs_constraints();
-    A2_rng.generate_r1cs_constraints();
-    A3_rng.generate_r1cs_constraints();
-    A4_rng.generate_r1cs_constraints();
+    // Witness
+    for (size_t i = 0; i < N; ++i) A_rng[i]->witness_from_uint64(arr[i]);
+    std::vector<uint64_t> cur_vals = arr;
+    for (size_t L = 0; L < network.size(); ++L) {
+        std::vector<uint64_t> next_vals = cur_vals;
+        for (size_t e = 0; e < network[L].size(); ++e) {
+            std::unique_ptr<CompEntry>& ce_ptr = network[L][e];
+            const size_t i = ce_ptr->i, j = ce_ptr->j;
+            ce_ptr->cmp->generate_r1cs_witness(cur_vals[i], cur_vals[j]);
+            ce_ptr->t_rng->witness_from_uint64(ce_ptr->cmp->t_u64);
+            ce_ptr->u_rng->witness_from_uint64(ce_ptr->cmp->u_u64);
+            ce_ptr->v_rng->witness_from_uint64(ce_ptr->cmp->v_u64);
+            next_vals[i] = ce_ptr->cmp->u_u64;
+            next_vals[j] = ce_ptr->cmp->v_u64;
+        }
+        cur_vals = next_vals;
+    }
+    for (size_t i = 0; i < N; ++i) pb.val(Y[i]) = FieldT(cur_vals[i]);
+    for (size_t i = 0; i + 1 < N; ++i) {
+        uint64_t diff = (cur_vals[i+1] >= cur_vals[i]) ? (cur_vals[i+1] - cur_vals[i]) : 0;
+        Ty_rng[i]->witness_from_uint64(diff);
+    }
+    for (size_t i = 0; i < N; ++i) {
+        pb.val(A2[i]) = FieldT(arr[i]) * FieldT(arr[i]);
+        pb.val(Y2[i]) = FieldT(cur_vals[i]) * FieldT(cur_vals[i]);
+    }
 
-    cmp12.generate_r1cs_constraints();
-    cmp34.generate_r1cs_constraints();
-    cmp13.generate_r1cs_constraints();
-    cmp24.generate_r1cs_constraints();
-    cmp23.generate_r1cs_constraints();
-
-    cmp12_t_rng.generate_r1cs_constraints();
-    cmp34_t_rng.generate_r1cs_constraints();
-    cmp13_t_rng.generate_r1cs_constraints();
-    cmp24_t_rng.generate_r1cs_constraints();
-    cmp23_t_rng.generate_r1cs_constraints();
-
-    b1_rng.generate_r1cs_constraints();
-    b2_rng.generate_r1cs_constraints();
-    b3_rng.generate_r1cs_constraints();
-    b4_rng.generate_r1cs_constraints();
-    c1_rng.generate_r1cs_constraints();
-    c2_rng.generate_r1cs_constraints();
-    c3_rng.generate_r1cs_constraints();
-    c4_rng.generate_r1cs_constraints();
-    d2_rng.generate_r1cs_constraints();
-    d3_rng.generate_r1cs_constraints();
-
-    // Example private inputs (< 2^k_bits)
-    uint64_t a1 = 9, a2 = 1, a3 = 7, a4 = 3;
-
-    // Witness for inputs
-    A1_rng.witness_from_uint64(a1);
-    A2_rng.witness_from_uint64(a2);
-    A3_rng.witness_from_uint64(a3);
-    A4_rng.witness_from_uint64(a4);
-
-    // Stage 1
-    cmp12.generate_r1cs_witness(a1, a2);
-    b1_rng.witness_from_uint64(cmp12.u_u64);
-    b2_rng.witness_from_uint64(cmp12.v_u64);
-
-    cmp34.generate_r1cs_witness(a3, a4);
-    b3_rng.witness_from_uint64(cmp34.u_u64);
-    b4_rng.witness_from_uint64(cmp34.v_u64);
-
-    // Stage 2
-    cmp13.generate_r1cs_witness(cmp12.u_u64, cmp34.u_u64);
-    c1_rng.witness_from_uint64(cmp13.u_u64);
-    c3_rng.witness_from_uint64(cmp13.v_u64);
-
-    cmp24.generate_r1cs_witness(cmp12.v_u64, cmp34.v_u64);
-    c2_rng.witness_from_uint64(cmp24.u_u64);
-    c4_rng.witness_from_uint64(cmp24.v_u64);
-
-    // Stage 3
-    cmp23.generate_r1cs_witness(cmp24.u_u64, cmp13.v_u64);
-    d2_rng.witness_from_uint64(cmp23.u_u64);
-    d3_rng.witness_from_uint64(cmp23.v_u64);
-
-    // Public outputs
-    pb.val(Y1) = pb.val(c1);
-    pb.val(Y2) = pb.val(d2);
-    pb.val(Y3) = pb.val(d3);
-    pb.val(Y4) = pb.val(c4);
-
+    // Check + Prove/Verify
     auto primary = pb.primary_input();
-    std::cout << "Primary (Y1..Y4): "
-              << primary[0] << ", "
-              << primary[1] << ", "
-              << primary[2] << ", "
-              << primary[3] << std::endl;
+    std::cout << "Sorted ints: ";
+    for (size_t i = 0; i < N; ++i) {
+        std::cout << cur_vals[i] << (i+1 < N ? ", " : "\n");
+    }
+    std::cout << "[Sort] is_satisfied = " << (pb.is_satisfied() ? "yes" : "no") << std::endl;
 
-    std::cout << "[A] is_satisfied = " << (pb.is_satisfied() ? "yes" : "no") << std::endl;
-
-    // Prove & verify (Groth16)
     const auto keypair = r1cs_gg_ppzksnark_generator<ppT>(pb.get_constraint_system());
     const auto proof   = r1cs_gg_ppzksnark_prover    <ppT>(keypair.pk, primary, pb.auxiliary_input());
     const bool ok_str  = r1cs_gg_ppzksnark_verifier_strong_IC<ppT>(keypair.vk, primary, proof);
     const bool ok_weak = r1cs_gg_ppzksnark_verifier_weak_IC  <ppT>(keypair.vk, primary, proof);
-    std::cout << "A: Verified strong_IC=" << (ok_str ? "true" : "false")
-              << " | weak_IC=" << (ok_weak ? "true" : "false") << std::endl;
+    std::cout << "Sort: Verified strong_IC=" << (ok_str ? "true" : "false")
+              << " | weak_IC="               << (ok_weak ? "true" : "false") << std::endl;
 }
 
-// ---------- [B] Verify that B is a correct sorted version of A ----------
+// ---------- [B] Verify that B is a correct sorted version of A (generic N) ----------
 template<typename ppT>
-void run_verify_sorted_demo_B_full(size_t k_bits)
+void run_verify_sorted_demo_B_generic(size_t k_bits,
+                                      const std::vector<uint64_t>& A_vals,
+                                      const std::vector<uint64_t>& B_vals)
 {
     using FieldT = libff::Fr<ppT>;
+    const size_t N = A_vals.size();
+    if (B_vals.size() != N) {
+        throw std::runtime_error("A and B must have the same length.");
+    }
+
     protoboard<FieldT> pb;
 
-    // Public values
-    pb_variable<FieldT> A1, A2, A3, A4;
-    pb_variable<FieldT> B1, B2, B3, B4;
-    A1.allocate(pb, "A1"); A2.allocate(pb, "A2");
-    A3.allocate(pb, "A3"); A4.allocate(pb, "A4");
-    B1.allocate(pb, "B1"); B2.allocate(pb, "B2");
-    B3.allocate(pb, "B3"); B4.allocate(pb, "B4");
-    pb.set_input_sizes(8);  // public inputs: A1..A4, B1..B4
+    // Public inputs: A[0..N-1], B[0..N-1]
+    std::vector<pb_variable<FieldT>> A(N), B(N);
+    for (size_t i = 0; i < N; ++i) {
+        A[i].allocate(pb, "A" + std::to_string(i));
+        B[i].allocate(pb, "B" + std::to_string(i));
+    }
+    pb.set_input_sizes(2 * N);
 
-    // Range gadgets for sorted B
-    pb_variable<FieldT> t12, t23, t34;
-    t12.allocate(pb, "t12"); t23.allocate(pb, "t23"); t34.allocate(pb, "t34");
-    kbits_range_manual<FieldT> t12_rng(pb, t12, k_bits, "t12_rng");
-    kbits_range_manual<FieldT> t23_rng(pb, t23, k_bits, "t23_rng");
-    kbits_range_manual<FieldT> t34_rng(pb, t34, k_bits, "t34_rng");
+    // Range-check A,B (k bits)
+    std::vector<std::unique_ptr<kbits_range_manual<FieldT>>> A_rng(N), B_rng(N);
+    for (size_t i = 0; i < N; ++i) {
+        A_rng[i].reset(new kbits_range_manual<FieldT>(pb, A[i], k_bits, "A"+std::to_string(i)+"_rng"));
+        B_rng[i].reset(new kbits_range_manual<FieldT>(pb, B[i], k_bits, "B"+std::to_string(i)+"_rng"));
+    }
 
-    // --- 1️⃣ Monotonicity check: ensure B1 ≤ B2 ≤ B3 ≤ B4 ---
-    pb.add_r1cs_constraint(r1cs_constraint<FieldT>(1, B2 - B1, t12), "t12 = B2 - B1");
-    pb.add_r1cs_constraint(r1cs_constraint<FieldT>(1, B3 - B2, t23), "t23 = B3 - B2");
-    pb.add_r1cs_constraint(r1cs_constraint<FieldT>(1, B4 - B3, t34), "t34 = B4 - B3");
+    // 1) Monotonicity for B: t[i] = B[i+1] - B[i] >= 0 (k-bit)
+    std::vector<pb_variable<FieldT>> t(N > 0 ? N-1 : 0);
+    std::vector<std::unique_ptr<kbits_range_manual<FieldT>>> t_rng(N > 0 ? N-1 : 0);
+    for (size_t i = 0; i + 1 < N; ++i) {
+        t[i].allocate(pb, "t" + std::to_string(i));
+        pb.add_r1cs_constraint(
+            r1cs_constraint<FieldT>(1, B[i+1] - B[i], t[i]),
+            "t = B[i+1]-B[i]");
+        t_rng[i].reset(new kbits_range_manual<FieldT>(pb, t[i], k_bits, "t"+std::to_string(i)+"_rng"));
+    }
 
-    t12_rng.generate_r1cs_constraints();
-    t23_rng.generate_r1cs_constraints();
-    t34_rng.generate_r1cs_constraints();
+    // 2) Multiset equality via product of (r + ·) using accumulators
+    const FieldT r = FieldT("12345");
 
-    // --- 2️⃣ Multiset equality check: ∏(r + A[i]) = ∏(r + B[i]) ---
-    const FieldT r = FieldT("12345"); // public challenge constant
+    std::vector<pb_variable<FieldT>> accA(N), accB(N);
+    accA[0].allocate(pb, "accA_0");
+    accB[0].allocate(pb, "accB_0");
+    pb.add_r1cs_constraint(r1cs_constraint<FieldT>(1, accA[0], A[0] + r), "accA_0 = r + A0");
+    pb.add_r1cs_constraint(r1cs_constraint<FieldT>(1, accB[0], B[0] + r), "accB_0 = r + B0");
 
-    // Intermediate variables for partial products
-    pb_variable<FieldT> pA12, pA34, pB12, pB34;
-    pA12.allocate(pb, "pA12"); pA34.allocate(pb, "pA34");
-    pB12.allocate(pb, "pB12"); pB34.allocate(pb, "pB34");
+    for (size_t i = 1; i < N; ++i) {
+        accA[i].allocate(pb, "accA_" + std::to_string(i));
+        accB[i].allocate(pb, "accB_" + std::to_string(i));
+        pb.add_r1cs_constraint(
+            r1cs_constraint<FieldT>(accA[i-1], A[i] + r, accA[i]),
+            "accA_step_" + std::to_string(i));
+        pb.add_r1cs_constraint(
+            r1cs_constraint<FieldT>(accB[i-1], B[i] + r, accB[i]),
+            "accB_step_" + std::to_string(i));
+    }
 
-    pb_variable<FieldT> prodA, prodB;
-    prodA.allocate(pb, "prodA");
-    prodB.allocate(pb, "prodB");
-
-    // Step 1: (r + Ai) * (r + Aj)
+    // ∏(r+A[i]) == ∏(r+B[i])
     pb.add_r1cs_constraint(
-        r1cs_constraint<FieldT>(A1 + r, A2 + r, pA12),
-        "pA12 = (r+A1)*(r+A2)");
-    pb.add_r1cs_constraint(
-        r1cs_constraint<FieldT>(A3 + r, A4 + r, pA34),
-        "pA34 = (r+A3)*(r+A4)");
+        r1cs_constraint<FieldT>(1, accA[N-1], accB[N-1]),
+        "prod_equal");
 
-    pb.add_r1cs_constraint(
-        r1cs_constraint<FieldT>(B1 + r, B2 + r, pB12),
-        "pB12 = (r+B1)*(r+B2)");
-    pb.add_r1cs_constraint(
-        r1cs_constraint<FieldT>(B3 + r, B4 + r, pB34),
-        "pB34 = (r+B3)*(r+B4)");
+    pb_variable<FieldT> sumA, sumB, sumsqA, sumsqB;
+    sumA.allocate(pb, "sumA"); sumB.allocate(pb, "sumB");
+    sumsqA.allocate(pb, "sumsqA"); sumsqB.allocate(pb, "sumsqB");
 
-    // Step 2: combine partials
-    pb.add_r1cs_constraint(
-        r1cs_constraint<FieldT>(pA12, pA34, prodA),
-        "prodA = pA12 * pA34");
-    pb.add_r1cs_constraint(
-        r1cs_constraint<FieldT>(pB12, pB34, prodB),
-        "prodB = pB12 * pB34");
+    std::vector<pb_variable<FieldT>> sqA_vars(N), sqB_vars(N);
 
-    // Step 3: enforce equality
-    pb.add_r1cs_constraint(
-        r1cs_constraint<FieldT>(1, prodA, prodB),
-        "∏(r + A[i]) = ∏(r + B[i])");
+    linear_combination<FieldT> lc_sumA, lc_sumB, lc_sumsqA, lc_sumsqB;
+    for (size_t i = 0; i < N; ++i) {
+        lc_sumA.add_term(A[i], FieldT::one());
+        lc_sumB.add_term(B[i], FieldT::one());
 
-    // --- Witness assignment ---
-    uint64_t A_vals[4] = {35, 12, 12, 200};
-    uint64_t B_vals[4] = {12, 12, 35, 200};
+        sqA_vars[i].allocate(pb, "sqA_"+std::to_string(i));
+        sqB_vars[i].allocate(pb, "sqB_"+std::to_string(i));
+        pb.add_r1cs_constraint(r1cs_constraint<FieldT>(A[i], A[i], sqA_vars[i]), "sqA");
+        pb.add_r1cs_constraint(r1cs_constraint<FieldT>(B[i], B[i], sqB_vars[i]), "sqB");
 
-    pb.val(A1) = FieldT(A_vals[0]);
-    pb.val(A2) = FieldT(A_vals[1]);
-    pb.val(A3) = FieldT(A_vals[2]);
-    pb.val(A4) = FieldT(A_vals[3]);
-    pb.val(B1) = FieldT(B_vals[0]);
-    pb.val(B2) = FieldT(B_vals[1]);
-    pb.val(B3) = FieldT(B_vals[2]);
-    pb.val(B4) = FieldT(B_vals[3]);
+        lc_sumsqA.add_term(sqA_vars[i], FieldT::one());
+        lc_sumsqB.add_term(sqB_vars[i], FieldT::one());
+    }
+    pb.add_r1cs_constraint(r1cs_constraint<FieldT>(1, sumA, lc_sumA), "sumA_def");
+    pb.add_r1cs_constraint(r1cs_constraint<FieldT>(1, sumB, lc_sumB), "sumB_def");
+    pb.add_r1cs_constraint(r1cs_constraint<FieldT>(1, sumsqA, lc_sumsqA), "sumsqA_def");
+    pb.add_r1cs_constraint(r1cs_constraint<FieldT>(1, sumsqB, lc_sumsqB), "sumsqB_def");
+    pb.add_r1cs_constraint(r1cs_constraint<FieldT>(1, sumA,   sumB),   "sum_equal");
+    pb.add_r1cs_constraint(r1cs_constraint<FieldT>(1, sumsqA, sumsqB), "sumsq_equal");
 
-    // Compute differences for monotonicity
-    t12_rng.witness_from_uint64(B_vals[1] - B_vals[0]);
-    t23_rng.witness_from_uint64(B_vals[2] - B_vals[1]);
-    t34_rng.witness_from_uint64(B_vals[3] - B_vals[2]);
+    // ---- Generate constraints for ranges ----
+    for (size_t i = 0; i < N; ++i) { A_rng[i]->generate_r1cs_constraints(); }
+    for (size_t i = 0; i < N; ++i) { B_rng[i]->generate_r1cs_constraints(); }
+    for (size_t i = 0; i + 1 < N; ++i) { t_rng[i]->generate_r1cs_constraints(); }
 
-    // Compute product values
-    FieldT pA_12 = (r + FieldT(A_vals[0])) * (r + FieldT(A_vals[1]));
-    FieldT pA_34 = (r + FieldT(A_vals[2])) * (r + FieldT(A_vals[3]));
-    FieldT pB_12 = (r + FieldT(B_vals[0])) * (r + FieldT(B_vals[1]));
-    FieldT pB_34 = (r + FieldT(B_vals[2])) * (r + FieldT(B_vals[3]));
+    // ---- Witness assignment ----
+    for (size_t i = 0; i < N; ++i) {
+        A_rng[i]->witness_from_uint64(A_vals[i]);
+        B_rng[i]->witness_from_uint64(B_vals[i]);
+    }
+    for (size_t i = 0; i + 1 < N; ++i) {
+        const uint64_t diff = (B_vals[i+1] >= B_vals[i]) ? (B_vals[i+1] - B_vals[i]) : 0ULL;
+        t_rng[i]->witness_from_uint64(diff);
+    }
 
-    pb.val(pA12) = pA_12;
-    pb.val(pA34) = pA_34;
-    pb.val(pB12) = pB_12;
-    pb.val(pB34) = pB_34;
+    // Accumulators
+    pb.val(accA[0]) = FieldT(A_vals[0]) + r;
+    pb.val(accB[0]) = FieldT(B_vals[0]) + r;
+    for (size_t i = 1; i < N; ++i) {
+        pb.val(accA[i]) = pb.val(accA[i-1]) * (FieldT(A_vals[i]) + r);
+        pb.val(accB[i]) = pb.val(accB[i-1]) * (FieldT(B_vals[i]) + r);
+    }
 
-    pb.val(prodA) = pA_12 * pA_34;
-    pb.val(prodB) = pB_12 * pB_34;
+    // sum / sumsq witnesses (sqA_i, sqB_i)
+    FieldT sa = FieldT::zero(), sb = FieldT::zero();
+    FieldT ssa = FieldT::zero(), ssb = FieldT::zero();
+    for (size_t i = 0; i < N; ++i) {
+        FieldT a = FieldT(A_vals[i]);
+        FieldT b = FieldT(B_vals[i]);
+        sa += a; sb += b;
+        FieldT aa = a*a, bb = b*b;
+        ssa += aa; ssb += bb;
+        pb.val(sqA_vars[i]) = aa;
+        pb.val(sqB_vars[i]) = bb;
+    }
+    pb.val(sumA) = sa;    pb.val(sumB) = sb;
+    pb.val(sumsqA) = ssa; pb.val(sumsqB) = ssb;
 
-    // --- Verify ---
-    std::cout << "[B-full] is_satisfied = "
-              << (pb.is_satisfied() ? "yes" : "no") << std::endl;
+    std::cout << "[B-generic] is_satisfied = " << (pb.is_satisfied() ? "yes" : "no") << std::endl;
 
     const auto keypair = r1cs_gg_ppzksnark_generator<ppT>(pb.get_constraint_system());
-    const auto proof   = r1cs_gg_ppzksnark_prover<ppT>(
-        keypair.pk, pb.primary_input(), pb.auxiliary_input());
-    const bool ok_str  = r1cs_gg_ppzksnark_verifier_strong_IC<ppT>(
-        keypair.vk, pb.primary_input(), proof);
-    const bool ok_weak = r1cs_gg_ppzksnark_verifier_weak_IC<ppT>(
-        keypair.vk, pb.primary_input(), proof);
+    const auto proof   = r1cs_gg_ppzksnark_prover    <ppT>(keypair.pk, pb.primary_input(), pb.auxiliary_input());
+    const bool ok_str  = r1cs_gg_ppzksnark_verifier_strong_IC<ppT>(keypair.vk, pb.primary_input(), proof);
+    const bool ok_weak = r1cs_gg_ppzksnark_verifier_weak_IC  <ppT>(keypair.vk, pb.primary_input(), proof);
 
-    std::cout << "B-full: Verified strong_IC=" << (ok_str ? "true" : "false")
+    std::cout << "B-generic: Verified strong_IC=" << (ok_str ? "true" : "false")
               << " | weak_IC=" << (ok_weak ? "true" : "false") << std::endl;
 }
-
 
 int main()
 {
     default_r1cs_gg_ppzksnark_pp::init_public_params();
 
-    const size_t k_bits = 16; // change to 32/64 if needed (< 2^k)
+    const size_t k_bits = 16;
 
+    // ===== A: sorting-network demo (N = power of two) =====
+    std::vector<uint64_t> arr = {35, 12, 12, 200, 7, 3, 9, 1};
     std::cout << "[100%] Built target zk_sort_example\n";
     std::cout << "Reset time counters for profiling\n\n";
+    std::cout << "[A] Sorting network demo (odd-even mergesort), N=" << arr.size() << "\n";
+    run_sorting_network_demo_generic<default_r1cs_gg_ppzksnark_pp>(k_bits, arr);
 
-    std::cout << "[A] Sorting network demo\n";
-    run_sorting_network_demo_A<default_r1cs_gg_ppzksnark_pp>(k_bits);
-
-    std::cout << "\n[B] Verify-sorted demo\n";
-    run_verify_sorted_demo_B_full<default_r1cs_gg_ppzksnark_pp>(k_bits);
+    // ===== B: verify-sorted demo (generic N) =====
+    std::vector<uint64_t> A_pub = {35, 12, 12, 200, 7,  3,  9, 1};
+    std::vector<uint64_t> B_pub = { 1,  3,  7,  9, 12, 12, 35, 200};
+    std::cout << "\n[B] Verify-sorted demo (generic N=" << A_pub.size() << ")\n";
+    run_verify_sorted_demo_B_generic<default_r1cs_gg_ppzksnark_pp>(k_bits, A_pub, B_pub);
 
     std::cout << "\nAll done.\n";
     return 0;
